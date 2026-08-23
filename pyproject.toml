@@ -1,0 +1,33 @@
+[project]
+name = "fin-analyzer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "YPatel30", email = "ykp15@scarletmail.rutgers.edu" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pymongo>=4.9",
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    "pydantic-settings>=2.6",
+    "langchain-text-splitters>=0.3",
+    "tiktoken>=0.8",
+]
+
+[project.scripts]
+ingest = "fin_analyzer.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
