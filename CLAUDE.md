@@ -30,17 +30,25 @@ The git repo folder itself is `FinAnalyzer` (pre-existing, not renamed); the
 
 - **Phase 1 (done)** — ingest SEC 10-K filings into MongoDB. CLI only,
   `uv run ingest TICKER [TICKER ...]`. No AI of any kind. See below.
-- **Phase 2+ (not started, don't build yet)** — the eventual system adds:
-  RAG over the filings (embeddings + vector search), historical financial
-  data, a FastAPI REST API, and an MCP server. None of this exists yet.
-  If a task seems to need one of these to finish something in Phase 1,
-  stop and say so rather than building it.
+- **Phase 2 (done)** — embeddings (Gemini API) + MongoDB Atlas Vector
+  Search over the chunks. `uv run embed`, `uv run search "..."`,
+  `uv run eval`. Retrieval only — no LLM call generates or answers
+  anything. See below.
+- **Phase 3+ (not started, don't build yet)** — the eventual system adds:
+  historical financial data, an LLM call that actually answers questions
+  using retrieved passages (Phase 2 stops at "retrieve good passages"), a
+  FastAPI REST API, and an MCP server. None of this exists yet. If a task
+  seems to need one of these to finish something earlier, stop and say so
+  rather than building it.
 
 ## Explicitly out of scope until told otherwise
 
-Embeddings, vector search, any LLM/Gemini call, FastAPI, an MCP server,
-Docker, a frontend, async code, authentication, LangChain generally (the one
-exception already in use: `langchain-text-splitters`, for chunking only).
+Any LLM/chat/generation call (embeddings are fine, Phase 2 uses them via
+`google-genai` — *generation* is not), answer generation, prompt
+construction, FastAPI, an MCP server, reranking, Docker, a frontend, async
+code, authentication, caching layers, hybrid/keyword search, LangChain
+generally (the one exception already in use: `langchain-text-splitters`,
+for chunking only).
 
 ## Phase 1 architecture
 
@@ -146,9 +154,131 @@ chunk count without checking extracted character counts first.
 ~1000 tokens per chunk, ~150 token overlap — token-based (via tiktoken), not
 word-count-based, so the sizes are actually accurate.
 
+## Phase 2 architecture
+
+```
+src/fin_analyzer/
+  embeddings.py    # Gemini calls: batching, retry-on-429, re-normalization, dimension guard
+  vector_index.py  # Atlas Vector Search index create/wait (with the M0 driver-restriction fallback)
+  embed.py         # orchestrates: find chunks missing embeddings -> embed -> write -> ensure index
+  search.py        # Chunk dataclass + search(query, ticker=None, limit=5)
+  eval.py          # recall@5 over eval_data.py's 15 approved questions
+  eval_data.py     # the approved questions + expected phrases (see git history for how they were picked)
+  cli_embed.py / cli_search.py / cli_eval.py   # `embed` / `search` / `eval` entry points
+```
+
+### Embeddings (`embeddings.py`)
+
+- Model: `gemini-embedding-001`, truncated to `EMBEDDING_DIMENSIONS=768`
+  (natively 3072-dim) via `output_dimensionality`.
+- **task_type is asymmetric and this matters a lot**: chunks embed with
+  `RETRIEVAL_DOCUMENT` (in `embed.py`), search queries embed with
+  `RETRIEVAL_QUERY` (in `search.py`). Verified empirically (not just per
+  docs) that mixing them up doesn't crash — it silently inflates similarity
+  scores by ~0.03-0.05 and can flip close rankings. Nothing in this module
+  defaults task_type; every caller passes it explicitly so a mix-up can't
+  hide.
+- **Manual re-normalization is required.** Google's docs: gemini-embedding-001
+  only pre-normalizes at the full 3072 dims; a truncated 768-dim vector has
+  to be divided by its own L2 norm by hand (`embeddings._normalize`) or
+  cosine similarity is subtly wrong. Every vector's dimension is asserted
+  before it's allowed near Mongo.
+- **Free tier rate limit is tokens-per-minute, not requests-per-minute** —
+  found empirically: a 10-chunk call (~8K tokens) succeeded, a 50-chunk
+  call (~45K tokens) immediately hit 429. `embed.py` batches chunks by a
+  20K-token budget (not a fixed chunk count) and pauses 15s between
+  batches, on top of `embeddings.py`'s reactive retry-with-backoff on 429.
+- **A 429 does not fall back to per-item retries** — that's reserved for
+  genuinely per-item failures (a malformed single input). A 429 is an
+  account-level condition; retrying it 100x individually just hits the same
+  limit harder, which is what happened the first time this ran for real.
+- `embed.py` writes to Mongo incrementally, one token-budgeted batch at a
+  time, not all at once at the end — a run that stops partway (rate limit,
+  Ctrl-C) doesn't lose already-embedded chunks, and a rerun's "chunks
+  missing `embedding`" query picks up exactly where it left off.
+- **Oversized-chunk guard**: gemini-embedding-001 caps input at 2048
+  tokens/text, and newer embedding models tend to truncate silently rather
+  than error on an over-limit input — so this is a hard pre-check (via the
+  same tiktoken cl100k_base encoder `chunk.py` uses, an approximation of
+  Gemini's real tokenizer but good enough as a trip-wire) before any API
+  call, not a try/except. Finding one aborts the whole run — that's a
+  Phase 1 chunking issue to fix at the source, not something to paper over
+  here.
+
+### Vector index (`vector_index.py`)
+
+- Name: `chunks_vector_index`, on `finanalyzer.chunks`.
+- Definition: vector field `embedding` (768 dims, cosine similarity) +
+  `ticker` declared as a filter field (so `search()`'s optional ticker
+  argument can pre-filter — Atlas requires filter fields declared up front).
+- **M0 restricts driver-level index *management*** (`create_search_index()`,
+  `list_search_indexes()`) to M10+ clusters, confirmed both via MongoDB's
+  own community forum and by testing directly — though empirically, on this
+  project's actual cluster, driver-level creation worked fine (the M0
+  restriction may not be universal, or Atlas has relaxed it since). Either
+  way, `ensure_vector_index()` tries the driver path first and falls back
+  to printing the index JSON + manual Atlas UI steps if that's rejected.
+- **Readiness is never trusted from a keypress or a listed status field**
+  (list_search_indexes() being off-limits on M0 makes that unreliable
+  anyway) — `wait_until_ready()` runs an actual trivial `$vectorSearch`
+  probe query (using a real embedded chunk's own vector, so it costs zero
+  extra Gemini calls) in a backoff retry loop, capped at ~2 minutes. Missing
+  index = `OperationFailure`, still-building index = zero hits, ready index
+  = a hit — all three are treated explicitly.
+- Index creation is sequenced *after* embedding finishes, never before —
+  the index shouldn't be built against a field that's still being
+  populated, and the readiness probe needs a real vector to already exist.
+
+### Search (`search.py`)
+
+- `search(query, ticker=None, limit=5)` — matches this exact signature so
+  it's ergonomic to call directly; `db`/`settings` are keyword-only
+  overrides for reusing one connection across many calls (`eval.py`) or
+  injecting a fake (tests).
+- `$vectorSearch` is always pipeline stage 0. `numCandidates = limit * 15`
+  (Atlas's own guidance is roughly 10-20x `limit`).
+- Score is projected via `{"$meta": "vectorSearchScore"}`.
+
+### Retrieval eval (`eval.py`, `eval_data.py`)
+
+- 15 questions, grounded in real chunks (read out of the database, not
+  invented), spread across AAPL/MSFT/GOOGL and Business/Risk
+  Factors/MD&A. Each has an `expected_phrase` verified as an exact
+  substring of its source chunk before being approved.
+- Deliberately searches the *whole* corpus, no ticker filter, even though
+  each question's correct company is known — a real user question doesn't
+  pre-declare which company it's about, so filtering by the known-correct
+  ticker would test something easier than real usage.
+- **Result on the full corpus (5 tickers, 304 chunks) at the time this was
+  last run: 12/15 (80%)**, accepted as-is. 2 of the 3 misses were near-ties
+  (correct chunk ranked #6, score within 0.001-0.004 of the #5 cutoff) —
+  not a real problem, just noise inherent to how similar 10-K risk-factor
+  boilerplate reads. The third (Alphabet "Other Bets") was a genuine miss
+  at rank #11, diagnosed as a **chunking granularity** issue: that chunk's
+  ~1000 tokens bundle one relevant sentence together with several
+  paragraphs of unrelated general/AI-competition risk, diluting the pooled
+  embedding. Deliberately not treated as a bug to fix by changing chunk
+  size — that's a real Phase 1 tradeoff, revisit only if a future eval run
+  shows a worse or similar pattern.
+
+### Testing tradeoff: no live vector-search integration test
+
+M0 caps out at **3 total search indexes**; spending a second one on
+`finanalyzer_test.chunks` just for tests wasn't worth it. `search()`'s
+tests (`tests/test_search.py`) mock `db.chunks.aggregate()` with a canned,
+already-descending-score result set — testing that *our* query-building and
+result-mapping code is correct, not re-proving Atlas's own documented
+`$vectorSearch` ordering guarantee. `embed_missing_chunks()`'s tests use a
+fake embedder (no Gemini calls) and no-op `ensure_index_fn`/`wait_ready_fn`
+(no real Atlas index management) against real `finanalyzer_test` — those
+don't need a vector index at all, just chunk documents.
+
 ## Running things
 
 ```
-uv run ingest AAPL MSFT GOOGL   # the Phase 1 CLI
-uv run pytest                   # tests (needs .env configured — see README)
+uv run ingest AAPL MSFT GOOGL           # the Phase 1 CLI
+uv run embed                            # embed any chunks missing vectors (Phase 2)
+uv run search "how does Apple describe supply chain risk?"   # semantic search
+uv run eval                             # recall@5 over the approved eval questions
+uv run pytest                           # tests (needs .env configured — see README)
 ```

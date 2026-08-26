@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # 0.2s keeps us at 5 req/sec, well under it.
     request_sleep_seconds: float = 0.2
 
+    # Gemini embeddings (Phase 2). gemini-embedding-001 is natively 3072-dim;
+    # we request a truncated 768-dim vector to keep index size reasonable on
+    # M0 — see embeddings.py for the manual re-normalization this requires.
+    gemini_api_key: str
+    embedding_dimensions: int = 768
+    vector_index_name: str = "chunks_vector_index"
+
 
 def get_settings() -> Settings:
     """Small indirection so callers don't construct Settings() directly everywhere."""

@@ -8,8 +8,17 @@ across many small text nodes. The steps below deal with each problem in order.
 """
 
 import re
+import warnings
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+# 10-K primary documents are inline-XBRL: valid XHTML that also declares XML
+# namespaces (for the ix:/xbrli:/... tags), which makes bs4 guess "this might
+# be XML, are you sure you meant the HTML parser?" on every single file. We
+# do mean it — the visible body is HTML-shaped and that's what we're parsing
+# for — so this warning is a predictable false positive, not a real one to
+# leave firing on every run.
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # Tags that only ever carry formatting, never paragraph/heading structure.
 # We *unwrap* these (drop the tag, keep its text in place) rather than

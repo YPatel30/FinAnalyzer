@@ -15,10 +15,14 @@ dependencies = [
     "pydantic-settings>=2.6",
     "langchain-text-splitters>=0.3",
     "tiktoken>=0.8",
+    "google-genai>=1.0",
 ]
 
 [project.scripts]
 ingest = "fin_analyzer.cli:main"
+embed = "fin_analyzer.cli_embed:main"
+search = "fin_analyzer.cli_search:main"
+eval = "fin_analyzer.cli_eval:main"
 
 [dependency-groups]
 dev = [

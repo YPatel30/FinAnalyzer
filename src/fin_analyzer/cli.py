@@ -35,14 +35,27 @@ def main() -> None:
             failed.append(ticker)
 
     print(f"\nDone. Ingested {len(succeeded)}/{len(args.tickers)} tickers.")
-    _print_sample_chunks(db)
+    filing_ids = [result["filing_id"] for result in succeeded]
+    _print_sample_chunks(db, filing_ids)
 
     if failed:
         sys.exit(1)
 
 
-def _print_sample_chunks(db: Database, count: int = 3) -> None:
-    sample = list(db.chunks.aggregate([{"$sample": {"size": count}}]))
+def _print_sample_chunks(db: Database, filing_ids: list, count: int = 3) -> None:
+    """Sample only from filings ingested *this run* — sampling the whole
+    `chunks` collection would mostly show older tickers from past runs
+    once a few have accumulated, defeating the point of eyeballing what
+    was just ingested."""
+    if not filing_ids:
+        print("\nNo chunks to sample.")
+        return
+
+    pipeline = [
+        {"$match": {"filing_id": {"$in": filing_ids}}},
+        {"$sample": {"size": count}},
+    ]
+    sample = list(db.chunks.aggregate(pipeline))
     if not sample:
         print("\nNo chunks in the database to sample.")
         return
