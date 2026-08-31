@@ -34,21 +34,26 @@ The git repo folder itself is `FinAnalyzer` (pre-existing, not renamed); the
   Search over the chunks. `uv run embed`, `uv run search "..."`,
   `uv run eval`. Retrieval only — no LLM call generates or answers
   anything. See below.
-- **Phase 3+ (not started, don't build yet)** — the eventual system adds:
-  historical financial data, an LLM call that actually answers questions
-  using retrieved passages (Phase 2 stops at "retrieve good passages"), a
-  FastAPI REST API, and an MCP server. None of this exists yet. If a task
-  seems to need one of these to finish something earlier, stop and say so
-  rather than building it.
+- **Phase 3 (done)** — generation: retrieval + a real LLM call that
+  answers with inline citations, this is where it becomes RAG. Answer
+  generation and the groundedness judge run on **Groq**, not Gemini (see
+  below for why) — Gemini stays embeddings-only. `uv run ask "..."`,
+  extends `uv run eval` with groundedness % and refusal rate. See below.
+- **Phase 4+ (not started, don't build yet)** — the eventual system adds:
+  historical financial data, a FastAPI REST API, and an MCP server. None
+  of this exists yet. If a task seems to need one of these to finish
+  something earlier, stop and say so rather than building it.
 
 ## Explicitly out of scope until told otherwise
 
-Any LLM/chat/generation call (embeddings are fine, Phase 2 uses them via
-`google-genai` — *generation* is not), answer generation, prompt
-construction, FastAPI, an MCP server, reranking, Docker, a frontend, async
-code, authentication, caching layers, hybrid/keyword search, LangChain
-generally (the one exception already in use: `langchain-text-splitters`,
-for chunking only).
+FastAPI, an MCP server, reranking, streaming responses, multi-turn
+conversation or chat history, tool calling / agents, structured numeric
+data (Phase 3 demonstrated *why* this is needed — see the fiscal-2023
+numeric-trap note below — but doesn't build it), Docker, a frontend, async
+code, authentication, caching layers (eval.py's checkpoint file is scoped
+narrowly to its own resumability, not a general cache — see below),
+hybrid/keyword search, LangChain generally (the one exception already in
+use: `langchain-text-splitters`, for chunking only).
 
 ## Phase 1 architecture
 
@@ -237,7 +242,19 @@ src/fin_analyzer/
   injecting a fake (tests).
 - `$vectorSearch` is always pipeline stage 0. `numCandidates = limit * 15`
   (Atlas's own guidance is roughly 10-20x `limit`).
-- Score is projected via `{"$meta": "vectorSearchScore"}`.
+- Score is projected via `{"$meta": "vectorSearchScore"}` — in its own
+  `$project` immediately after `$vectorSearch`, before the `$lookup` below,
+  since that metadata isn't reliably readable in a later stage.
+- `Chunk` also carries `filing_date`, joined from `filings` via a `$lookup`
+  on `filing_id` (Phase 3 added this — ask()'s prompt needs it). Chose
+  `$lookup` over denormalizing `filing_date` onto each chunk at ingest
+  time, even though the latter is arguably the better MongoDB instinct
+  (filing_date is immutable — no update-anomaly risk, and `search`/`ask`
+  is the hot path while `ingest` is rare, so paying the join cost on every
+  query to save nothing on writes is backwards at real scale). Reasonable
+  for now because there's no real query volume yet and `filing_id` staying
+  the only foreign key keeps the door open cheaply if Phase 4+ wants more
+  filing-level fields later. Revisit if this ever sees real traffic.
 
 ### Retrieval eval (`eval.py`, `eval_data.py`)
 
@@ -273,12 +290,195 @@ fake embedder (no Gemini calls) and no-op `ensure_index_fn`/`wait_ready_fn`
 (no real Atlas index management) against real `finanalyzer_test` — those
 don't need a vector index at all, just chunk documents.
 
+## Phase 3 architecture
+
+```
+src/fin_analyzer/
+  core/
+    prompts.py     # SYSTEM_INSTRUCTION, REFUSAL_MESSAGE, context/user templates,
+                    #   JUDGE_SYSTEM_INSTRUCTION/JUDGE_PROMPT_TEMPLATE
+    models.py      # Answer, Source, GroundednessVerdict (Pydantic)
+    citations.py   # parse_cited_numbers() -- pure, regex-based [n] extraction
+  providers/
+    base.py        # Provider ABC (generate, generate_structured, list_model_names),
+                    #   QuotaExhaustedError
+    groq_provider.py  # the only concrete Provider right now
+    registry.py    # get_provider(name, settings) -> Provider
+    validate.py    # validate_configured_models() -- startup check
+  generation.py    # generate_answer() / judge_groundedness() -- role-aware,
+                    #   settings pick provider+model per role
+  ask.py           # retrieve_and_build_prompt() + ask() -- the core function
+  eval_checkpoint.py  # JSON checkpoint + CallCounter for `uv run eval`
+  refusal_data.py  # the 5 approved refusal-set questions
+  cli_ask.py       # `ask` entry point, --show-prompt
+```
+
+### Why generation is on Groq, not Gemini (`providers/`)
+
+- The spec asked for `gemini-2.5-flash`. It returned 404 on this project's
+  API key — "no longer available to new users" — discovered by actually
+  calling it, not from docs (Google's docs still list it as available).
+  Google's own error message named `gemini-3.6-flash` as the replacement;
+  verified working and adopted.
+- `gemini-3.6-flash` then turned out to cap at **20 `generate_content`
+  requests per day** on the free tier — a number that appears nowhere in
+  public docs, only in the 429 error payload
+  (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`, `quotaValue: 20`)
+  once hit. A full eval run needs ~35 generation calls; this cannot
+  complete in one day on that model, full stop, no amount of backoff fixes
+  a daily cap.
+- Rather than hunt for a third Gemini model name (the user's own
+  assessment: "the published free-tier numbers conflict across sources and
+  Google no longer documents them" — verifying more model names would just
+  be guessing again), generation moved to a different provider entirely:
+  **Groq**. Embeddings stay on Gemini, untouched — that quota is separate
+  and has worked reliably throughout.
+- This is why `providers/` exists as a real abstraction (`Provider` ABC +
+  a registry keyed by a config string), not a second hardcoded call site:
+  having been bitten twice by a hardcoded model name at the same place,
+  adding or swapping a provider from here on should be one class plus one
+  registry line, never a refactor of `ask.py`/`eval.py`.
+- **Startup validation is not optional.** The two models this project
+  actually planned to use (`llama-3.3-70b-versatile`, `llama-3.1-8b-instant`)
+  turned out not to exist on this Groq key at all (`list_model_names()`
+  confirmed it directly) — Groq's own lineup had moved on. Verified
+  replacements, confirmed via the account's own `console.groq.com` billing
+  page (free tier, no card) and a live rate-limit-header read (not
+  trusted from any blog): **`openai/gpt-oss-120b`** (answers) /
+  **`openai/gpt-oss-20b`** (judge) — 1K requests/day, 30/min, 8K tokens/min,
+  200K tokens/day each, comfortably above what an eval run needs.
+  `cli_ask.py`/`cli_eval.py` both call `validate_configured_models()` at
+  startup so a bad model name fails immediately and loudly, not mid-eval
+  after quota is already spent — exactly how the Gemini situation was
+  first discovered.
+- Groq's strict JSON-schema mode (used for the judge's structured output)
+  requires `additionalProperties: false` on every object in the schema —
+  Pydantic's `model_json_schema()` doesn't set that by default. Found via
+  a real 400 from the API; `groq_provider.py`'s `_strict_schema()` walks
+  the schema (including `$defs`, for nested models) and adds it.
+- `QuotaExhaustedError` (`providers/base.py`) is how a provider tells
+  callers "retrying this in-process won't help" — `GroqProvider`
+  distinguishes a brief per-minute rate limit (worth a short backoff, read
+  from the real `retry-after` response header) from a long-window one
+  (>120s away per that same header) by the header value itself, not by
+  guessing from the error message text.
+
+### The prompt (`core/prompts.py`)
+
+- Numbered context block: `[n] {ticker} (filed {filing_date}): {text}` —
+  full chunk text, never truncated (truncation is a display-time choice,
+  see `Source.text` below).
+- The system instruction frames scope positively ("you answer questions
+  about the filings provided... you have no knowledge beyond them") and
+  gives a decision procedure (check company match, topic match, and
+  tense/forecast — treat any failure as "not in the context") rather than
+  a bare prohibition, then defines **one exact refusal string**
+  (`REFUSAL_MESSAGE`) the model must use verbatim on any of those checks
+  failing. One string, reused everywhere: `eval.py`'s refusal-rate check
+  string-matches against it instead of spending a judge call per refusal
+  question, and `ask()` returns the same literal string when retrieval
+  comes back empty (see below) — nothing downstream can tell "the model
+  refused" apart from "there was nothing to even ask about."
+- Citation format is `[2][4]` (adjacent brackets, no comma) specifically so
+  parsing is a trivial regex. `core/citations.py`'s `CITATION_RE` also
+  matches fullwidth brackets (`【2】`) — a real model response used them
+  instead of ASCII ones, which silently zeroed out every citation match
+  until this was found and fixed.
+- The groundedness judge reuses `CONTEXT_CHUNK_TEMPLATE` to build its own
+  context block from the same `Answer.sources`, so it's checking the
+  answer against literally the same numbered excerpts it was built from.
+
+### `ask()` (`ask.py`)
+
+- `retrieve_and_build_prompt()` is split out from `ask()` specifically so
+  `cli_ask.py --show-prompt` can print the exact prompt without spending a
+  generation call — it calls this directly, then separately calls `ask()`
+  for the real answer (one extra cheap embedding call when the flag is
+  used, in exchange for `ask()` keeping the exact `(question, ticker, k)`
+  signature asked for, no debug-only parameters).
+- Empty retrieval (`search()` returns nothing) short-circuits straight to
+  `REFUSAL_MESSAGE` with `sources=[]`, `context_used=0` — no generation
+  call spent on a question with nothing to answer from.
+- `Source.text` is the **full** chunk text, not a truncated excerpt —
+  the groundedness judge needs the whole passage; a short display excerpt
+  is `cli_ask.py`'s choice at print time, the same pattern `cli_search.py`
+  already used for `Chunk.text`.
+
+### Eval extensions (`eval.py`, `eval_checkpoint.py`, `refusal_data.py`)
+
+- **Groundedness**: for each of the same 15 `eval_data.py` questions,
+  `ask()` generates a real answer, then a *second, independently
+  configured* model (`judge_model` — a genuinely different model from
+  `generation_model`, not just a different role prompt on the same one)
+  checks every factual claim against the same context excerpts. This is a
+  model judging a model — printed as a caveat every time, not proof.
+- **Refusal set** (`refusal_data.py`): 5 questions spanning company-not-
+  ingested, forward-looking, and out-of-domain. Deliberately *not* named
+  in the system instruction (would be teaching to the test) — a generic
+  decision procedure has to catch them on its own.
+- **Score-floor investigation**: before building the refusal mechanism,
+  logged top-1 `search()` scores for all 15 answerable + 5 refusal
+  questions. The two distributions overlap substantially (answerable
+  0.8357-0.8944, refusal 0.7665-0.8632) — forward-looking questions about
+  an in-corpus company score in the middle of the answerable range (they
+  *are* topically relevant, just not temporally answerable), and only the
+  wildly-out-of-domain case is a clean outlier. Conclusion: no score-floor
+  short-circuit — it would only catch the easiest case and risks false-
+  positive refusals on real low-scoring-but-answerable questions.
+- **Checkpointing** (`eval_checkpoint.py`): a full run spends ~35
+  generation calls; a crash or quota wall partway through previously lost
+  every in-memory result. Each question's result (recall, answer, judge
+  verdict) is persisted to `.cache/eval_checkpoint.json` the moment it's
+  computed — plain JSON of built-in types, not pickle, so it doesn't
+  depend on today's class definitions matching tomorrow's. A rerun skips
+  anything already checkpointed. Scoped narrowly to this script's own
+  resumability across runs — not a general cache for `ask()` in normal
+  use, which stays out of scope. `QuotaExhaustedError` stops the affected
+  loop cleanly (whatever completed is kept and reported) instead of a raw
+  traceback destroying an otherwise-successful partial run.
+- `CallCounter` prints every real (non-cached) API call as it happens and
+  is shared across all three eval stages in one run, so the total reflects
+  the whole invocation.
+
+### Results at the time this was last run (5 tickers, 304 chunks)
+
+- **recall@5: 12/15 (80%)** — unchanged from Phase 2, as expected
+  (retrieval logic didn't change).
+- **Groundedness: 13/15 (87% of judged answers)**. Both failures line up
+  exactly with 2 of the 3 recall@5 misses (the AAPL culture and GOOGL
+  financing near-ties) — a coherent, non-contradictory story: when
+  retrieval doesn't surface the right chunk, the model sometimes answers
+  anyway from tangential context (or, in the AAPL culture case, appears to
+  have answered from general knowledge despite instructions, producing a
+  claim with zero textual support), and the judge correctly flags it.
+  The third recall miss (GOOGL "Other Bets", the more severe rank-11 one)
+  did *not* also fail groundedness — the retrieved chunks included a
+  different, legitimately-relevant passage (the segment-reporting note)
+  that recall@5's single-expected-phrase check doesn't count as a hit but
+  that genuinely supports a correct answer. Recall@5 is a precision proxy,
+  not the same thing as "was the final answer actually right."
+- **Refusal rate: 5/5 (100%)** — no system-instruction tightening needed.
+- **The numeric trap** (`ask "What was Apple's total revenue in fiscal
+  2023?"`): the model refused — correctly, but the *reason* is the real
+  finding. Retrieval found exactly the right chunk (ranked #1, literally
+  "The following table shows net sales by segment for 2025, 2024 and
+  2023"), but the actual figures were never extracted into text at all —
+  they lived only in the `<table>` Phase 1's `extract.py` deliberately
+  drops. This is sharper than "embeddings are fuzzy and might retrieve the
+  wrong passage": a prose-oriented chunking pipeline structurally cannot
+  represent tabular numeric data as text, no matter how good retrieval or
+  generation get. Not fixed, per instruction — this is the argument for
+  routing numeric questions to real structured queries in a later phase,
+  not an incremental improvement on this one.
+
 ## Running things
 
 ```
 uv run ingest AAPL MSFT GOOGL           # the Phase 1 CLI
 uv run embed                            # embed any chunks missing vectors (Phase 2)
 uv run search "how does Apple describe supply chain risk?"   # semantic search
-uv run eval                             # recall@5 over the approved eval questions
+uv run ask "how does Apple describe supply chain risk?"      # cited, grounded answer (Phase 3)
+uv run ask "..." --ticker MSFT --k 3 --show-prompt           # print the exact prompt before sending it
+uv run eval                             # recall@5, groundedness %, refusal rate
 uv run pytest                           # tests (needs .env configured — see README)
 ```

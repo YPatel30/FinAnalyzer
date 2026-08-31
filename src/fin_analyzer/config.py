@@ -41,6 +41,21 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 768
     vector_index_name: str = "chunks_vector_index"
 
+    # Generation (Phase 3) — on Groq, not Gemini. Provider AND model are
+    # both config, never hardcoded at a call site (see providers/) — after
+    # gemini-2.5-flash got discontinued for new keys mid-project, and its
+    # replacement turned out to cap at 20 requests/day undocumented, a
+    # provider swap needs to be a settings change, not a refactor.
+    # Answer generation and the groundedness judge are deliberately
+    # different models (not just different roles of the same model) — a
+    # judge with no stake in having produced the answer it's checking is
+    # better methodology, not just quota isolation.
+    groq_api_key: str
+    generation_provider: str = "groq"
+    generation_model: str = "openai/gpt-oss-120b"
+    judge_provider: str = "groq"
+    judge_model: str = "openai/gpt-oss-20b"
+
 
 def get_settings() -> Settings:
     """Small indirection so callers don't construct Settings() directly everywhere."""

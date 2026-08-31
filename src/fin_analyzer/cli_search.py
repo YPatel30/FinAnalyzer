@@ -18,7 +18,7 @@ def main() -> None:
         return
 
     for chunk in results:
-        print(f"\n[score {chunk.score:.4f}] {chunk.ticker} chunk #{chunk.chunk_index}")
+        print(f"\n[score {chunk.score:.4f}] {chunk.ticker} chunk #{chunk.chunk_index} (filed {chunk.filing_date})")
         print(chunk.text[:300])
 
 

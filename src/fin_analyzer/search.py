@@ -1,10 +1,11 @@
-"""$vectorSearch over the chunks collection.
+"""$vectorSearch over the chunks collection, joined with filings for
+filing_date.
 
 search()'s primary signature intentionally takes just (query, ticker, limit)
 so it's ergonomic to call directly (a REPL, eval.py, cli_search.py) without
 wiring up Mongo each time — db/settings are keyword-only overrides, used by
-eval.py (to reuse one connection across 15 calls instead of opening a new
-one each time) and by tests (to inject a fake).
+eval.py (to reuse one connection across many calls) and by tests (to inject
+a fake).
 """
 
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ class Chunk:
     chunk_index: int
     text: str
     score: float
+    filing_date: str
 
 
 def search(
@@ -46,7 +48,16 @@ def search(
     # RETRIEVAL_QUERY, never RETRIEVAL_DOCUMENT (that's for chunks, in embed.py).
     query_vector = embed_texts([query], RETRIEVAL_QUERY, settings)[0]
 
-    pipeline = [{"$vectorSearch": _vector_search_stage(query_vector, ticker, limit, settings)}, _project_stage()]
+    pipeline = [
+        {"$vectorSearch": _vector_search_stage(query_vector, ticker, limit, settings)},
+        # $meta: "vectorSearchScore" is only reliably readable in the stage
+        # immediately after $vectorSearch — pulled into a plain field here,
+        # before the $lookup below, rather than risking it not surviving
+        # the join.
+        _extract_score_stage(),
+        _join_filing_date_stage(),
+        _final_shape_stage(),
+    ]
     return [Chunk(**doc) for doc in db.chunks.aggregate(pipeline)]
 
 
@@ -65,13 +76,43 @@ def _vector_search_stage(query_vector: list[float], ticker: str | None, limit: i
     return stage
 
 
-def _project_stage() -> dict:
+def _extract_score_stage() -> dict:
     return {
         "$project": {
             "_id": 0,
             "ticker": 1,
             "chunk_index": 1,
             "text": 1,
+            "filing_id": 1,
             "score": {"$meta": "vectorSearchScore"},
+        }
+    }
+
+
+def _join_filing_date_stage() -> dict:
+    # chunks only store filing_id (a reference) — see search.py's docstring
+    # and CLAUDE.md for why this is a $lookup rather than a denormalized
+    # filing_date field on each chunk.
+    return {
+        "$lookup": {
+            "from": "filings",
+            "localField": "filing_id",
+            "foreignField": "_id",
+            "as": "filing",
+        }
+    }
+
+
+def _final_shape_stage() -> dict:
+    return {
+        "$project": {
+            "ticker": 1,
+            "chunk_index": 1,
+            "text": 1,
+            "score": 1,
+            # $lookup always produces an array (one match here, since
+            # filing_id -> filings._id is one-to-one); pull out the single
+            # filing_date instead of returning a one-element array of docs.
+            "filing_date": {"$arrayElemAt": ["$filing.filing_date", 0]},
         }
     }

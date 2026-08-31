@@ -1,10 +1,11 @@
 # FinAnalyzer
 
 Phase 1: pull SEC 10-K filings into MongoDB. Phase 2: embed the chunks
-(Gemini API) and search them with MongoDB Atlas Vector Search — retrieval
-only, no LLM generates or answers anything yet. No API server, no MCP
-server — those are later phases. See [CLAUDE.md](CLAUDE.md) for the full
-design notes and constraints.
+(Gemini API) and search them with MongoDB Atlas Vector Search. Phase 3:
+generate a real, cited answer from those retrieved passages — this is
+where it becomes RAG. No API server, no MCP server — those are later
+phases. See [CLAUDE.md](CLAUDE.md) for the full design notes and
+constraints.
 
 ## Setup
 
@@ -32,6 +33,14 @@ design notes and constraints.
    - `GEMINI_API_KEY` — for Phase 2 embeddings. Get one at
      [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
      Not needed just to run Phase 1's `ingest`.
+   - `GROQ_API_KEY` — for Phase 3 text generation (`ask`/`eval`'s
+     groundedness judge). Get one at
+     [console.groq.com](https://console.groq.com). Free tier, no card.
+     Not needed for `ingest`/`embed`/`search`. If `GENERATION_MODEL`/
+     `JUDGE_MODEL` ever 404 (providers change their lineups), see the
+     one-liner in `.env.example` to list what's actually available to
+     your key — `ask`/`eval` also check this at startup and fail loudly
+     before spending anything if a configured model isn't available.
 
    `.env` is gitignored — it will never be committed.
 
@@ -99,6 +108,37 @@ genuinely relevant chunk make it into the top 5 results. Prints each
 failure individually, showing what came back instead, so retrieval quality
 can be eyeballed rather than trusted blindly.
 
+## Ask (Phase 3)
+
+```
+uv run ask "how does Apple describe supply chain risk?"
+uv run ask "what does Microsoft say about AI competition?" --ticker MSFT
+uv run ask "..." --k 3 --show-prompt
+```
+
+Retrieves the top `k` chunks, builds a numbered prompt from them, and asks
+an LLM to answer *only* from that context, citing sources inline as
+`[1][2]`. Prints the answer, then every source with its score and whether
+it was actually cited versus just retrieved. `--show-prompt` prints the
+exact system instruction and user prompt before it's sent — no description
+of it, the literal text.
+
+Answers only from the provided context, on purpose — if the filings don't
+contain the answer (wrong company, a forward-looking question, or
+something entirely off-topic), it says so explicitly rather than guessing.
+It also can't answer precise numeric questions well: 10-K tables are
+dropped during extraction (Phase 1), so a figure that only ever appeared
+in a table was never captured as text for anything downstream to find.
+
+```
+uv run eval
+```
+
+Also reports **groundedness** (a second, different model checks whether
+every claim in each answer is actually supported by its sources — a model
+judging a model, useful signal, not proof) and **refusal rate** (5
+questions the corpus provably can't answer — a good system refuses all 5).
+
 ## Tests
 
 ```
@@ -126,8 +166,17 @@ src/fin_analyzer/
   vector_index.py   # Atlas Vector Search index create/wait
   embed.py          # orchestrates: find missing embeddings -> embed -> write -> ensure index
   search.py         # Chunk dataclass + search()
-  eval.py           # recall@5 over eval_data.py's approved questions
-  eval_data.py       # the approved eval questions + expected phrases
-  cli_embed.py / cli_search.py / cli_eval.py   # `embed` / `search` / `eval` entry points
+  eval.py           # recall@5, groundedness, refusal-rate eval
+  eval_data.py      # the approved eval questions + expected phrases
+  eval_checkpoint.py  # eval's own checkpoint file + call counter
+  refusal_data.py   # the 5 approved refusal-set questions
+  cli_embed.py / cli_search.py / cli_eval.py / cli_ask.py   # entry points
+  core/
+    prompts.py      # the answer + judge prompt templates
+    models.py       # Answer, Source, GroundednessVerdict
+    citations.py    # [n] citation parsing
+  providers/        # Provider abstraction (currently: Groq) for generation
+  generation.py     # generate_answer() / judge_groundedness()
+  ask.py            # ask() -- the Phase 3 core function
 tests/
 ```
