@@ -39,19 +39,25 @@ The git repo folder itself is `FinAnalyzer` (pre-existing, not renamed); the
   generation and the groundedness judge run on **Groq**, not Gemini (see
   below for why) — Gemini stays embeddings-only. `uv run ask "..."`,
   extends `uv run eval` with groundedness % and refusal rate. See below.
-- **Phase 4+ (not started, don't build yet)** — the eventual system adds:
-  historical financial data, a FastAPI REST API, and an MCP server. None
-  of this exists yet. If a task seems to need one of these to finish
-  something earlier, stop and say so rather than building it.
+- **Phase 4 (done)** — a FastAPI REST API, a thin layer over the logic
+  above. `uv run serve`. See below.
+- **Phase 5+ (not started, don't build yet)** — the eventual system adds
+  historical financial data and an MCP server wrapping the same
+  `core`/business-logic layer Phase 4 wraps. None of this exists yet. If a
+  task seems to need one of these to finish something earlier, stop and
+  say so rather than building it.
 
 ## Explicitly out of scope until told otherwise
 
-FastAPI, an MCP server, reranking, streaming responses, multi-turn
+An MCP server, reranking, streaming responses (SSE), multi-turn
 conversation or chat history, tool calling / agents, structured numeric
 data (Phase 3 demonstrated *why* this is needed — see the fiscal-2023
-numeric-trap note below — but doesn't build it), Docker, a frontend, async
-code, authentication, caching layers (eval.py's checkpoint file is scoped
-narrowly to its own resumability, not a general cache — see below),
+numeric-trap note below — but doesn't build it), Docker, deployment, a
+frontend, async code (including an async database driver — sync pymongo
+throughout, even in the API — see below), authentication (Phase 4's README
+has two sentences on where it would hook in, not built), caching layers
+(eval.py's checkpoint file is scoped narrowly to its own resumability, not
+a general cache; same for the API — no response caching), rate limiting,
 hybrid/keyword search, LangChain generally (the one exception already in
 use: `langchain-text-splitters`, for chunking only).
 
@@ -240,6 +246,9 @@ src/fin_analyzer/
   it's ergonomic to call directly; `db`/`settings` are keyword-only
   overrides for reusing one connection across many calls (`eval.py`) or
   injecting a fake (tests).
+- **Raises `TickerNotFound`/`IndexNotReady` itself** (Phase 4) — see the
+  Phase 4 section below for why ticker validation lives here and not in
+  the API route handler.
 - `$vectorSearch` is always pipeline stage 0. `numCandidates = limit * 15`
   (Atlas's own guidance is roughly 10-20x `limit`).
 - Score is projected via `{"$meta": "vectorSearchScore"}` — in its own
@@ -471,6 +480,173 @@ src/fin_analyzer/
   routing numeric questions to real structured queries in a later phase,
   not an incremental improvement on this one.
 
+## Phase 4 architecture
+
+```
+src/fin_analyzer/
+  core/
+    exceptions.py    # NEW -- TickerNotFound, QuotaExhausted (moved here from
+                      #   providers/base.py), IndexNotReady, JobNotFound. Plain
+                      #   Python, no fastapi import -- ever, that's the hard rule.
+  companies.py        # list_companies(), ticker_exists() -- nothing read the
+                       #   companies collection back before this
+  jobs.py              # the /ingest job state machine -- a `jobs` Mongo
+                        #   collection, not an in-memory dict (see below)
+  health.py            # GET /health's logic: Mongo ping + a single-shot
+                        #   vector-index probe
+  api/
+    app.py             # FastAPI(), lifespan (Mongo client setup/teardown),
+                        #   CORS, exception handlers, request-ID logging
+    dependencies.py    # get_db_dependency()/get_settings_dependency() --
+                        #   the shared Mongo client from app.state
+    schemas.py         # ALL request/response models -- never core/models.py
+                        #   or search.py's Chunk directly
+    routes.py          # all 6 routes; `def` not `async def` throughout
+  cli_serve.py         # `uv run serve` entry point
+```
+
+`api/` is the *only* place allowed to import `fastapi` — not `core/`, not
+`providers/`, not any existing business-logic module (`search.py`, `ask.py`,
+`ingest.py`, the three new ones above). One-directional dependency: `api/`
+imports from everything else, nothing else imports from `api/`. This is
+what lets Phase 5's MCP server wrap the same logic without untangling any
+HTTP concerns out of it first.
+
+### The routes
+
+```
+GET  /health                  liveness + Mongo connectivity + index status
+GET  /companies               what's ingested
+POST /search                  retrieval only, no generation
+POST /ask                     full RAG answer with citations
+POST /ingest                  kick off ingestion -> 202 + job_id
+GET  /ingest/{job_id}         poll job status
+```
+
+`/search` exists separately from `/ask` on purpose — retrieval without
+generation is genuinely useful, cheaper, and makes the retrieve-vs-generate
+split visible in the API surface, same as the CLI already does with
+`search`/`ask` as separate commands.
+
+### Exception → status mapping (`core/exceptions.py` → `api/app.py`)
+
+| Exception | Raised where | Status |
+|---|---|---|
+| `TickerNotFound` | `search()` itself (see below — not the route) | 404 |
+| `JobNotFound` | `jobs.get_job()` | 404 |
+| `QuotaExhausted` | `GroqProvider._call()`, with `retry_after_seconds` when Groq's own header gave one | 429 (+ `Retry-After` header if known) |
+| `IndexNotReady` | `search()`, wrapping a raw pymongo `OperationFailure` | 503 |
+| (unhandled) | anywhere | 500, traceback logged server-side with the request id, never returned to the client |
+| Pydantic validation | automatic | 422 |
+
+All five are registered as `@app.exception_handler(...)` in `app.py` —
+routes never `try`/`except` any of these themselves, keeping them thin.
+
+### Ticker validation moved into `search()`, not the route handler
+
+Originally proposed as a route-level check; overturned during review, and
+rightly — "this company isn't in the corpus" is a domain fact, equally
+true for the CLI and for Phase 5's MCP tools, not an HTTP concern.
+Validating only in a route handler would've left the CLI's pre-existing
+silent-empty-results bug in place (`uv run search "..." --ticker FAKE`
+used to just print "No results.") and meant Phase 5 either duplicates the
+check or reintroduces the same bug. Fixed at the source instead:
+`search()` raises `TickerNotFound` directly when an explicit `ticker` is
+given and isn't in `companies`; `ask()` inherits this for free since it
+calls `search()` internally; both CLIs (`cli_search.py`, `cli_ask.py`) now
+catch it and print a clean message instead of a raw traceback.
+`ticker=None` ("search everything") is unaffected — the check only runs
+when a ticker is explicitly supplied.
+
+This is a **different mechanism** from Phase 3's refusal behavior, and the
+two can coexist without conflict: `ask(question, ticker="TSLA")` raises
+`TickerNotFound` before any retrieval happens; `ask("what are Tesla's risk
+factors?")` with no ticker filter still runs retrieval (finds nothing
+genuinely relevant), and the system instruction's refusal path handles it
+as before. One is a hard precondition check on an explicit parameter, the
+other is the model reasoning about retrieved content — they don't overlap.
+
+### `search()` also now raises `IndexNotReady`
+
+The real `$vectorSearch` call is wrapped in `try/except OperationFailure`,
+re-raised as `IndexNotReady` — so the business-logic layer never lets a
+raw pymongo exception escape to a caller that shouldn't need to know
+pymongo exists (the API layer, or a future MCP tool).
+
+### `jobs.py`: why a `jobs` Mongo collection, not an in-memory dict
+
+1. **Multiple worker processes.** The moment this API runs with more than
+   one worker (`uvicorn --workers 4`, or several instances behind a load
+   balancer — the first thing anyone does to handle real concurrent
+   traffic), each worker has its own separate memory. `POST /ingest`
+   landing on worker A writes to worker A's dict; `GET /ingest/{job_id}`
+   landing on worker B (ordinary round-robin routing) finds nothing —
+   a false 404 for a job that's actually running fine. Not an edge case;
+   the default failure mode the instant you scale past one process.
+2. **Process restarts.** A crash or redeploy while a job is in flight
+   wipes the dict entirely. The client that started the job can't tell
+   "it finished before the restart" from "it never ran" — both look like
+   a 404. Mongo survives the process restarting.
+3. **Orphan detection.** A job document stuck in `"running"` with an old
+   `started_at` and no progress is a real, observable state — the process
+   that was running it died mid-work. A dict can't represent this at all:
+   it vanishes with the process, so there's no "stuck" state left to
+   observe, only silence. `started_at` is stored on every job for exactly
+   this reason; actually reaping stale jobs is future work, not built here.
+
+Job id is a fresh `uuid4`, not Mongo's own `_id` — decouples the public API
+contract from the storage layer. `jobs.job_id` has a unique index (every
+poll looks it up; without one that's a full collection scan, worse as more
+ingests accumulate). One job can request several tickers; one ticker
+failing doesn't fail the others — `results` carries per-ticker status/
+chunk_count/error, and overall job status is `failed` if *any* ticker
+failed, `succeeded` only if *all* did (mirrors `ingest.py`'s CLI, which
+already continues past a per-ticker failure). `run_ingest_job()` reuses
+`ingest_ticker()` (Phase 1) completely unchanged — it's only a state-
+tracking wrapper around it.
+
+### `def`, never `async def`
+
+Every route handler is plain `def`. This project uses sync `pymongo`
+throughout (a deliberate choice from Phase 1 — see above), including here.
+An `async def` handler runs directly on the single event loop thread; a
+blocking call inside it (any pymongo call, or the Gemini/Groq HTTP calls
+inside `search()`/`ask()`) stalls that one thread every other concurrent
+request also depends on, and the whole server serializes under load —
+*silently*, since a single request in a manual test looks completely fine
+with nothing else on the loop to be blocked by it. A plain `def` handler
+runs in FastAPI's threadpool automatically, off the event loop, so a
+blocking call blocks only its own thread — the correct default for a sync
+driver, not a shortcut. The reasoning is written as a comment at the top
+of `routes.py` too, so it survives a future "helpful" `async def` edit.
+
+**Verified, not just asserted**: 10 concurrent `POST /search` requests vs.
+10 sequential, same query, against the running server —
+sequential 3.55s total (2.82 req/s), concurrent 0.77s total (12.91 req/s),
+a 4.58x speedup. Requests measurably don't serialize.
+
+### Lifespan, CORS, request logging
+
+- `app.py` uses the `lifespan` context manager (not the deprecated
+  `on_event` hooks) to open **one** `MongoClient` for the process's entire
+  lifetime and store it on `app.state` — `db.get_client()` opens a fresh
+  connection every call, correct for a short-lived CLI invocation, wrong
+  for a long-running server making that call on every request.
+- CORS allows `localhost`/`127.0.0.1` on any port (`allow_origin_regex`) —
+  no specific frontend or port chosen yet.
+- Every request gets a `uuid4` id, set on `request.state` before the route
+  runs and returned as an `X-Request-ID` response header; every log line
+  for that request (including the 500 handler's traceback log) carries the
+  same id, so a client-reported failure can be tied to one specific
+  server-side call rather than "something failed around 2:14pm".
+
+### Auth — not built, see README
+
+Two sentences in `README.md` on what would be added (an API-key or JWT
+dependency in `api/dependencies.py`, applied per-route) and why that's the
+right hook point (keeps the check itself out of `core/`, same principle as
+the exception mapping). Not implemented.
+
 ## Running things
 
 ```
@@ -480,5 +656,6 @@ uv run search "how does Apple describe supply chain risk?"   # semantic search
 uv run ask "how does Apple describe supply chain risk?"      # cited, grounded answer (Phase 3)
 uv run ask "..." --ticker MSFT --k 3 --show-prompt           # print the exact prompt before sending it
 uv run eval                             # recall@5, groundedness %, refusal rate
+uv run serve                            # FastAPI server on :8000 -- /docs for the Swagger UI (Phase 4)
 uv run pytest                           # tests (needs .env configured — see README)
 ```

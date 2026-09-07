@@ -13,6 +13,10 @@ task_type, not the chunk-side one.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+from pymongo.errors import OperationFailure
+
+from fin_analyzer.core.exceptions import IndexNotReady, TickerNotFound
 from fin_analyzer.search import Chunk, search
 
 # Shaped exactly like what our final $project stage emits — already in the
@@ -73,3 +77,49 @@ def test_search_embeds_the_query_as_retrieval_query(mock_embed_texts):
     texts, task_type = call_args[0], call_args[1]
     assert texts == ["any query"]
     assert task_type == "RETRIEVAL_QUERY"  # never RETRIEVAL_DOCUMENT — that's the chunk-side task_type
+
+
+@patch("fin_analyzer.search.ticker_exists")
+@patch("fin_analyzer.search.embed_texts")
+def test_search_raises_ticker_not_found_for_an_uningested_ticker(mock_embed_texts, mock_ticker_exists):
+    # Raised from search() itself, not just at an API boundary — see
+    # search.py and CLAUDE.md for why: this is a domain fact ("this company
+    # isn't in the corpus"), true for the CLI and any future caller alike.
+    mock_ticker_exists.return_value = False
+    fake_db = MagicMock()
+    fake_settings = MagicMock(vector_index_name="chunks_vector_index")
+
+    with pytest.raises(TickerNotFound):
+        search("any query", ticker="TSLA", db=fake_db, settings=fake_settings)
+
+    # Nothing was spent trying to answer an unanswerable request.
+    mock_embed_texts.assert_not_called()
+    fake_db.chunks.aggregate.assert_not_called()
+
+
+@patch("fin_analyzer.search.ticker_exists")
+@patch("fin_analyzer.search.embed_texts")
+def test_search_with_no_ticker_never_checks_ticker_existence(mock_embed_texts, mock_ticker_exists):
+    # ticker=None means "search everything" and must stay valid — the
+    # existence check only applies when a ticker is explicitly supplied.
+    mock_embed_texts.return_value = [[0.1] * 768]
+    fake_db = MagicMock()
+    fake_db.chunks.aggregate.return_value = []
+    fake_settings = MagicMock(vector_index_name="chunks_vector_index")
+
+    search("any query", db=fake_db, settings=fake_settings)
+
+    mock_ticker_exists.assert_not_called()
+
+
+@patch("fin_analyzer.search.ticker_exists")
+@patch("fin_analyzer.search.embed_texts")
+def test_search_raises_index_not_ready_on_operation_failure(mock_embed_texts, mock_ticker_exists):
+    mock_ticker_exists.return_value = True
+    mock_embed_texts.return_value = [[0.1] * 768]
+    fake_db = MagicMock()
+    fake_db.chunks.aggregate.side_effect = OperationFailure("index not found")
+    fake_settings = MagicMock(vector_index_name="chunks_vector_index")
+
+    with pytest.raises(IndexNotReady):
+        search("any query", db=fake_db, settings=fake_settings)

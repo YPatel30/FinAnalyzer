@@ -3,9 +3,9 @@
 Phase 1: pull SEC 10-K filings into MongoDB. Phase 2: embed the chunks
 (Gemini API) and search them with MongoDB Atlas Vector Search. Phase 3:
 generate a real, cited answer from those retrieved passages — this is
-where it becomes RAG. No API server, no MCP server — those are later
-phases. See [CLAUDE.md](CLAUDE.md) for the full design notes and
-constraints.
+where it becomes RAG. Phase 4: a FastAPI REST API — a thin layer over the
+same logic, nothing new underneath it. No MCP server yet — that's next.
+See [CLAUDE.md](CLAUDE.md) for the full design notes and constraints.
 
 ## Setup
 
@@ -139,16 +139,58 @@ every claim in each answer is actually supported by its sources — a model
 judging a model, useful signal, not proof) and **refusal rate** (5
 questions the corpus provably can't answer — a good system refuses all 5).
 
+## API server (Phase 4)
+
+```
+uv run serve
+```
+
+Starts the server at `http://127.0.0.1:8000`. Open
+[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the Swagger
+UI — every route can be exercised from the browser there.
+
+```
+GET  /health                  liveness + Mongo connectivity + vector index status
+GET  /companies               what's ingested
+POST /search                  retrieval only, no generation
+POST /ask                     full RAG answer with citations
+POST /ingest                  kick off ingestion, returns a job id (202 Accepted)
+GET  /ingest/{job_id}         poll that job's status
+```
+
+`/ingest` can't be synchronous — a real ingest takes minutes, longer than
+most clients will wait. It returns immediately with a job id; poll
+`GET /ingest/{job_id}` for `pending` → `running` → `succeeded`/`failed`,
+with per-ticker detail (one ticker failing doesn't hide that others
+succeeded). Job state lives in a `jobs` Mongo collection, not in server
+memory — see `CLAUDE.md` for why that distinction matters the moment this
+runs with more than one worker process.
+
+Errors come back as real HTTP status codes, not tracebacks: 404 for an
+unknown ticker or an unknown job id, 422 for a
+malformed request body (automatic, from the request schemas), 429 (with a
+`Retry-After` header when known) if the LLM provider's quota is exhausted,
+503 if the vector index isn't ready to query, 500 for anything unexpected
+(logged server-side with a request id, never sent to the client as a
+traceback).
+
+**Authentication is not built.** If added later, it would be an API-key or
+JWT dependency in `src/fin_analyzer/api/dependencies.py`, applied per-route
+via FastAPI's `Depends()` — kept out of `core/` and the other business-logic
+modules entirely, the same principle behind keeping HTTP status mapping
+out of them.
+
 ## Tests
 
 ```
 uv run pytest
 ```
 
-Needs `.env` configured (same file as above) — the idempotency tests write
-to a real `finanalyzer_test` database on your Atlas cluster (never
-`finanalyzer`) and clean up after themselves. No test makes a real SEC or
-Gemini network call — embedding-related tests use a fake embedder.
+Needs `.env` configured (same file as above) — the idempotency/API tests
+write to a real `finanalyzer_test` database on your Atlas cluster (never
+`finanalyzer`) and clean up after themselves. No test makes a real SEC,
+Gemini, or Groq network call — `search()`/`ask()`/the SEC calls inside
+ingest are all mocked at the boundary the corresponding test is checking.
 
 ## Project layout
 
@@ -165,18 +207,27 @@ src/fin_analyzer/
   embeddings.py     # Gemini calls: batching, retry, normalization, dimension guard
   vector_index.py   # Atlas Vector Search index create/wait
   embed.py          # orchestrates: find missing embeddings -> embed -> write -> ensure index
-  search.py         # Chunk dataclass + search()
+  search.py         # Chunk dataclass + search() -- raises TickerNotFound/IndexNotReady
   eval.py           # recall@5, groundedness, refusal-rate eval
   eval_data.py      # the approved eval questions + expected phrases
   eval_checkpoint.py  # eval's own checkpoint file + call counter
   refusal_data.py   # the 5 approved refusal-set questions
-  cli_embed.py / cli_search.py / cli_eval.py / cli_ask.py   # entry points
+  cli_embed.py / cli_search.py / cli_eval.py / cli_ask.py / cli_serve.py   # entry points
   core/
     prompts.py      # the answer + judge prompt templates
     models.py       # Answer, Source, GroundednessVerdict
     citations.py    # [n] citation parsing
+    exceptions.py   # TickerNotFound, QuotaExhausted, IndexNotReady, JobNotFound
   providers/        # Provider abstraction (currently: Groq) for generation
   generation.py     # generate_answer() / judge_groundedness()
   ask.py            # ask() -- the Phase 3 core function
+  companies.py      # list_companies(), ticker_exists()
+  jobs.py           # the /ingest job state machine (a `jobs` Mongo collection)
+  health.py         # GET /health's logic
+  api/
+    app.py          # FastAPI app: lifespan, CORS, exception handlers, request logging
+    dependencies.py # shared Mongo client as a FastAPI dependency
+    schemas.py       # API request/response models (separate from core/models.py)
+    routes.py        # all 6 routes
 tests/
 ```

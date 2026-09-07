@@ -17,7 +17,7 @@ All three are checkpointed (eval_checkpoint.py): each question's result is
 persisted to disk the moment it's computed, so a run interrupted by quota
 exhaustion doesn't lose completed work, and a rerun skips whatever's
 already there instead of re-spending scarce generation quota on it. A
-QuotaExhaustedError stops the affected loop cleanly — whatever completed
+QuotaExhausted stops the affected loop cleanly — whatever completed
 before the wall is kept and reported, not lost to a raw traceback.
 """
 
@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 
 from fin_analyzer.ask import ask
 from fin_analyzer.config import Settings, get_settings
+from fin_analyzer.core.exceptions import QuotaExhausted
 from fin_analyzer.core.models import Answer, GroundednessVerdict
 from fin_analyzer.core.prompts import (
     CONTEXT_CHUNK_TEMPLATE,
@@ -36,7 +37,6 @@ from fin_analyzer.db import get_db
 from fin_analyzer.eval_checkpoint import CallCounter, load_checkpoint, save_checkpoint
 from fin_analyzer.eval_data import EVAL_QUESTIONS
 from fin_analyzer.generation import judge_groundedness
-from fin_analyzer.providers.base import QuotaExhaustedError
 from fin_analyzer.refusal_data import REFUSAL_QUESTIONS
 from fin_analyzer.search import Chunk, search
 
@@ -115,7 +115,7 @@ def run_groundedness_eval(
                 save_checkpoint(checkpoint)
 
             results.append(GroundednessResult(question=q, answer=answer, verdict=verdict))
-    except QuotaExhaustedError as exc:
+    except QuotaExhausted as exc:
         print(f"\nQuota exhausted after {len(results)}/{len(EVAL_QUESTIONS)} groundedness questions: {exc}")
         print("Completed results are checkpointed in .cache/eval_checkpoint.json — rerun `uv run eval` to continue.")
 
@@ -143,7 +143,7 @@ def run_refusal_eval(
             answer = _cached_ask(q["question"], checkpoint, counter, k=k, db=db, settings=settings)
             refused = answer.answer.strip() == REFUSAL_MESSAGE
             results.append(RefusalResult(question=q, answer=answer, refused=refused))
-    except QuotaExhaustedError as exc:
+    except QuotaExhausted as exc:
         print(f"\nQuota exhausted after {len(results)}/{len(REFUSAL_QUESTIONS)} refusal questions: {exc}")
         print("Completed results are checkpointed in .cache/eval_checkpoint.json — rerun `uv run eval` to continue.")
 

@@ -25,3 +25,4 @@ def test_db(test_settings: Settings):
     db.companies.delete_many({})
     db.filings.delete_many({})
     db.chunks.delete_many({})
+    db.jobs.delete_many({})

@@ -5,8 +5,8 @@ import sys
 
 from fin_analyzer.ask import ask, retrieve_and_build_prompt
 from fin_analyzer.config import get_settings
+from fin_analyzer.core.exceptions import QuotaExhausted, TickerNotFound
 from fin_analyzer.core.prompts import SYSTEM_INSTRUCTION
-from fin_analyzer.providers.base import QuotaExhaustedError
 from fin_analyzer.providers.validate import validate_configured_models
 
 
@@ -28,20 +28,25 @@ def main() -> None:
         print(f"Startup check failed: {exc}")
         sys.exit(1)
 
-    if args.show_prompt:
-        user_prompt, _ = retrieve_and_build_prompt(args.question, ticker=args.ticker, k=args.k, settings=settings)
-        print("=== SYSTEM INSTRUCTION ===")
-        print(SYSTEM_INSTRUCTION)
-        print("=== USER PROMPT ===")
-        if user_prompt is None:
-            print("(nothing retrieved — ask() will refuse without calling the model at all)")
-        else:
-            print(user_prompt)
-        print()
-
     try:
+        if args.show_prompt:
+            user_prompt, _ = retrieve_and_build_prompt(
+                args.question, ticker=args.ticker, k=args.k, settings=settings
+            )
+            print("=== SYSTEM INSTRUCTION ===")
+            print(SYSTEM_INSTRUCTION)
+            print("=== USER PROMPT ===")
+            if user_prompt is None:
+                print("(nothing retrieved — ask() will refuse without calling the model at all)")
+            else:
+                print(user_prompt)
+            print()
+
         result = ask(args.question, ticker=args.ticker, k=args.k, settings=settings)
-    except QuotaExhaustedError as exc:
+    except TickerNotFound as exc:
+        print(f"\n{exc}")
+        sys.exit(1)
+    except QuotaExhausted as exc:
         print(f"\nGeneration quota exhausted: {exc}")
         sys.exit(1)
 

@@ -18,6 +18,7 @@ dependencies = [
     "google-genai>=1.0",
     "pydantic>=2.6",
     "groq>=1.7.0",
+    "fastapi[standard]>=0.141.1",
 ]
 
 [project.scripts]
@@ -26,6 +27,7 @@ embed = "fin_analyzer.cli_embed:main"
 search = "fin_analyzer.cli_search:main"
 eval = "fin_analyzer.cli_eval:main"
 ask = "fin_analyzer.cli_ask:main"
+serve = "fin_analyzer.cli_serve:main"
 
 [dependency-groups]
 dev = [

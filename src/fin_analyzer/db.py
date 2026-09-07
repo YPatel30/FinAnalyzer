@@ -28,7 +28,11 @@ def ensure_indexes(db: Database) -> None:
     - chunks {ticker, filing_id}: compound, not unique — dedup for chunks is
       handled at write time (delete-then-insert in ingest.py), this index just
       makes "give me all chunks for this filing" fast.
+    - jobs.job_id: unique — every GET /ingest/{job_id} poll looks up by this
+      field (Phase 4); without an index that's a full collection scan on
+      every poll, which only gets worse as more ingests accumulate.
     """
     db.companies.create_index([("ticker", ASCENDING)], unique=True)
     db.filings.create_index([("accession_no", ASCENDING)], unique=True)
     db.chunks.create_index([("ticker", ASCENDING), ("filing_id", ASCENDING)])
+    db.jobs.create_index([("job_id", ASCENDING)], unique=True)

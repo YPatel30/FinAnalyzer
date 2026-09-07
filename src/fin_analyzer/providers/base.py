@@ -15,15 +15,10 @@ provider should mean writing one class (below) plus one registry entry
 
 from abc import ABC, abstractmethod
 
-
-class QuotaExhaustedError(Exception):
-    """A provider's quota is exhausted in a way that retrying in-process
-    won't fix — a long-window (e.g. daily) cap, as opposed to a brief rate
-    limit worth a short backoff. Provider implementations are responsible
-    for telling these apart (see groq_provider.py) and raising this only
-    for the former, so callers (eval.py) can stop a loop cleanly instead of
-    burning retries against a wall that won't move for hours.
-    """
+# QuotaExhausted moved to core/exceptions.py (Phase 4) — the API layer
+# needs it to be a plain, fastapi-free type it can map to a 429, and core/
+# is where those live now. Import it from fin_analyzer.core.exceptions, not
+# from this module.
 
 
 class Provider(ABC):

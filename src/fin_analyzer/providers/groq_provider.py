@@ -12,7 +12,8 @@ import time
 
 import groq
 
-from fin_analyzer.providers.base import Provider, QuotaExhaustedError
+from fin_analyzer.core.exceptions import QuotaExhausted
+from fin_analyzer.providers.base import Provider
 
 MAX_RETRIES = 3
 INITIAL_BACKOFF_SECONDS = 2.0
@@ -20,8 +21,8 @@ BACKOFF_MULTIPLIER = 2.0
 
 # If Groq's own response says to wait longer than this, it's a long-window
 # (e.g. daily) limit, not a brief one — retrying in-process won't help, so
-# this is treated as QuotaExhaustedError immediately rather than sleeping
-# for however long the real reset actually takes.
+# this is treated as QuotaExhausted immediately rather than sleeping for
+# however long the real reset actually takes.
 MAX_WORTH_RETRYING_SECONDS = 120.0
 
 
@@ -72,7 +73,12 @@ class GroqProvider(Provider):
                 retry_after = _retry_after_seconds(exc)
                 is_long_wait = retry_after is not None and retry_after > MAX_WORTH_RETRYING_SECONDS
                 if is_long_wait or attempt == MAX_RETRIES:
-                    raise QuotaExhaustedError(str(exc)) from exc
+                    # retry_after is threaded through even on the
+                    # attempts-exhausted path (not just the long-wait one) —
+                    # a short-but-repeated 429 still gives the API layer a
+                    # real number for the Retry-After header, better than
+                    # making the client guess.
+                    raise QuotaExhausted(str(exc), retry_after_seconds=retry_after) from exc
                 wait = retry_after if retry_after is not None else delay
                 print(f"  rate limited, retrying in {wait:.0f}s (attempt {attempt}/{MAX_RETRIES})")
                 time.sleep(wait)

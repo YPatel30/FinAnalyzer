@@ -104,6 +104,21 @@ def wait_until_ready(
         delay = min(delay * 1.5, 20.0)
 
 
+def probe_once(db: Database, settings: Settings) -> bool | None:
+    """A single, non-retrying readiness check — unlike wait_until_ready(),
+    this must return fast (Phase 4's GET /health calls it, and a health
+    check shouldn't block a caller for up to 2 minutes). Returns None if
+    there's no embedded chunk yet to probe with — that's "unknown", not
+    "not ready": the index might be perfectly fine, there's just nothing to
+    test it with yet.
+    """
+    try:
+        probe_vector = _get_probe_vector(db)
+    except RuntimeError:
+        return None
+    return _probe_returns_a_hit(db, settings, probe_vector)
+
+
 def _probe_returns_a_hit(db: Database, settings: Settings, probe_vector: list[float]) -> bool:
     try:
         pipeline = [

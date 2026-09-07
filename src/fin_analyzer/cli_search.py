@@ -1,7 +1,9 @@
 """`uv run search "query" [--ticker AAPL] [--limit 5]`"""
 
 import argparse
+import sys
 
+from fin_analyzer.core.exceptions import TickerNotFound
 from fin_analyzer.search import search
 
 
@@ -12,7 +14,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
 
-    results = search(args.query, ticker=args.ticker, limit=args.limit)
+    try:
+        results = search(args.query, ticker=args.ticker, limit=args.limit)
+    except TickerNotFound as exc:
+        print(f"\n{exc}")
+        sys.exit(1)
+
     if not results:
         print("No results.")
         return

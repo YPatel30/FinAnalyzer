@@ -11,8 +11,11 @@ a fake).
 from dataclasses import dataclass
 
 from pymongo.database import Database
+from pymongo.errors import OperationFailure
 
+from fin_analyzer.companies import ticker_exists
 from fin_analyzer.config import Settings, get_settings
+from fin_analyzer.core.exceptions import IndexNotReady, TickerNotFound
 from fin_analyzer.db import get_db
 from fin_analyzer.embeddings import embed_texts
 
@@ -44,6 +47,15 @@ def search(
     settings = settings or get_settings()
     db = db if db is not None else get_db(settings)
 
+    # A ticker filter that doesn't match any ingested company would
+    # otherwise just silently return zero results, indistinguishable from
+    # "valid ticker, nothing relevant" — checked here, in the business
+    # logic, not just at an API boundary, so the CLI and any future caller
+    # (Phase 5's MCP tools) get the same clean failure instead of quietly
+    # searching nothing. ticker=None ("search everything") is unaffected.
+    if ticker is not None and not ticker_exists(db, ticker):
+        raise TickerNotFound(ticker)
+
     # The asymmetric half of task_type: a search query embeds as
     # RETRIEVAL_QUERY, never RETRIEVAL_DOCUMENT (that's for chunks, in embed.py).
     query_vector = embed_texts([query], RETRIEVAL_QUERY, settings)[0]
@@ -58,7 +70,15 @@ def search(
         _join_filing_date_stage(),
         _final_shape_stage(),
     ]
-    return [Chunk(**doc) for doc in db.chunks.aggregate(pipeline)]
+    try:
+        results = list(db.chunks.aggregate(pipeline))
+    except OperationFailure as exc:
+        # Missing or still-building index -- surfaced as a clean, named
+        # exception rather than letting a raw pymongo error leak out of the
+        # business-logic layer (the API maps this to 503).
+        raise IndexNotReady(f"Vector index {settings.vector_index_name!r} is not ready: {exc}") from exc
+
+    return [Chunk(**doc) for doc in results]
 
 
 def _vector_search_stage(query_vector: list[float], ticker: str | None, limit: int, settings: Settings) -> dict:
