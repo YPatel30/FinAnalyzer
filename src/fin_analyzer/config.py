@@ -10,9 +10,17 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# .env's path is resolved from this file's own location, not the process's
+# current working directory — every CLI so far has been launched via `uv run`
+# from the project root, where a relative ".env" happens to also work, which
+# hid this. Claude Desktop (Phase 5) launches the MCP server with its own
+# working directory (not necessarily this project's root) and a minimal
+# environment, so a cwd-relative path would silently fail to find .env there.
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     # Mongo Atlas connection string, e.g. mongodb+srv://user:pass@cluster.mongodb.net
     mongodb_uri: str

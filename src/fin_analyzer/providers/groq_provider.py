@@ -6,8 +6,13 @@ far more generous for the two roles this project needs (a generation model,
 a separate judge model), and — importantly — its quotas are inspectable
 live from the API's own response headers on every call, not just something
 to trust from docs or a blog post.
+
+Retry messages print to stderr, not stdout — this module is on ask()'s call
+path, and the MCP server (Phase 5) talks to its client over stdio, where
+stdout *is* the protocol.
 """
 
+import sys
 import time
 
 import groq
@@ -80,7 +85,7 @@ class GroqProvider(Provider):
                     # making the client guess.
                     raise QuotaExhausted(str(exc), retry_after_seconds=retry_after) from exc
                 wait = retry_after if retry_after is not None else delay
-                print(f"  rate limited, retrying in {wait:.0f}s (attempt {attempt}/{MAX_RETRIES})")
+                print(f"  rate limited, retrying in {wait:.0f}s (attempt {attempt}/{MAX_RETRIES})", file=sys.stderr)
                 time.sleep(wait)
                 delay *= BACKOFF_MULTIPLIER
 

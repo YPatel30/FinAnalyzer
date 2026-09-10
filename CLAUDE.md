@@ -41,25 +41,33 @@ The git repo folder itself is `FinAnalyzer` (pre-existing, not renamed); the
   extends `uv run eval` with groundedness % and refusal rate. See below.
 - **Phase 4 (done)** — a FastAPI REST API, a thin layer over the logic
   above. `uv run serve`. See below.
-- **Phase 5+ (not started, don't build yet)** — the eventual system adds
-  historical financial data and an MCP server wrapping the same
-  `core`/business-logic layer Phase 4 wraps. None of this exists yet. If a
-  task seems to need one of these to finish something earlier, stop and
-  say so rather than building it.
+- **Phase 5 (done)** — an MCP server exposing the same three capabilities
+  (list companies, search, ask) to a model instead of a programmer — the
+  same logic, wrapped twice, on purpose: building it twice is what shows
+  where REST and MCP actually differ. `uv run mcp-serve`, or
+  `mcp dev src/fin_analyzer/mcp_server.py` for the Inspector. See below,
+  and the README's REST-vs-MCP comparison.
+- **Phase 6+ (not started, don't build yet)** — the eventual system adds
+  historical financial data. None of this exists yet. If a task seems to
+  need it to finish something earlier, stop and say so rather than
+  building it.
 
 ## Explicitly out of scope until told otherwise
 
-An MCP server, reranking, streaming responses (SSE), multi-turn
-conversation or chat history, tool calling / agents, structured numeric
-data (Phase 3 demonstrated *why* this is needed — see the fiscal-2023
-numeric-trap note below — but doesn't build it), Docker, deployment, a
-frontend, async code (including an async database driver — sync pymongo
-throughout, even in the API — see below), authentication (Phase 4's README
-has two sentences on where it would hook in, not built), caching layers
-(eval.py's checkpoint file is scoped narrowly to its own resumability, not
-a general cache; same for the API — no response caching), rate limiting,
-hybrid/keyword search, LangChain generally (the one exception already in
-use: `langchain-text-splitters`, for chunking only).
+New capabilities beyond what Phase 5 exposes, MCP resources/prompts
+primitives (tools only), reranking, streaming responses (SSE or MCP
+progress notifications — see below for why these don't help the case
+Phase 4's job-polling solves), multi-turn conversation or chat history,
+tool calling / agents, structured numeric data (Phase 3 demonstrated *why*
+this is needed — see the fiscal-2023 numeric-trap note below — but doesn't
+build it), Docker, deployment, a frontend, async code (including an async
+database driver — sync pymongo throughout, even in the API and MCP server
+— see below), authentication (Phase 4's README has two sentences on where
+it would hook in, not built), caching layers (eval.py's checkpoint file is
+scoped narrowly to its own resumability, not a general cache; same for the
+API — no response caching), rate limiting, hybrid/keyword search,
+LangChain generally (the one exception already in use:
+`langchain-text-splitters`, for chunking only).
 
 ## Phase 1 architecture
 
@@ -647,6 +655,141 @@ dependency in `api/dependencies.py`, applied per-route) and why that's the
 right hook point (keeps the check itself out of `core/`, same principle as
 the exception mapping). Not implemented.
 
+## Phase 5 architecture
+
+```
+src/fin_analyzer/
+  mcp_server.py    # the whole MCP server: MCPServer instance, 3 tools,
+                    #   descriptions, model-readable error mapping
+```
+
+One file, not a subpackage like `api/` — 3 tools is proportionate to a
+single module; `api/` earned the split with 6 routes plus schemas/
+dependencies. Same hard rule as Phase 4: only this file is allowed to
+import `mcp`. `core/`, `providers/`, `search.py`, `ask.py`, `companies.py`
+don't know this server exists, same as they don't know `api/` exists.
+
+### `FastMCP` doesn't exist in the installed `mcp` package
+
+The spec named `FastMCP`; the installed version is `mcp==2.2.0`, where
+`FastMCP` was renamed to `MCPServer` (`from mcp.server.mcpserver import
+MCPServer`) — discovered via an actual `ImportError` naming the rename
+directly, not assumed. Same pattern as Phase 3's Gemini model names:
+verify against what's actually installed, don't trust a spec written
+against an earlier version. The API is otherwise a straightforward rename
+for what this project needs (`@mcp.tool(name=..., description=...)`,
+`mcp.run(transport="stdio")`).
+
+### Why `ingest` isn't an MCP tool
+
+REST's `202 Accepted` + poll works because the *client* — a program or a
+human — can hold a `job_id` in its own durable state and check back
+whenever, with no assumption about how long that takes. MCP has no clean
+equivalent: a tool call happens inside one bounded reasoning turn, and a
+model has no durable state between calls except the conversation
+transcript itself, which can be summarized, truncated, or just not there
+in a new session. MCP does have progress notifications for long-running
+calls, but they require the call to stay open — they let a model watch
+work it's already blocked on, and do nothing for the walk-away case REST's
+polling actually solves. Splitting `ingest` into `start`/`poll` tools
+would just relocate the problem: the model would have to remember the job
+id and decide, unprompted, to check back later, which isn't reliable.
+
+### Tool descriptions are prompts, not documentation
+
+A REST docstring is read by a developer who already decided to call the
+endpoint. An MCP tool description is read by a model deciding *whether* to
+call it, with no other context — so each one states one crisp positive
+criterion for when to use *this* tool (not mutual hedging toward the
+other), what its arguments mean in terms a model can supply (`ticker` must
+be one of the ingested companies, named explicitly), and what comes back.
+
+The first draft of `ask_filings`'s description included honest self-
+critique — "answered by a separate, smaller model", "some nuance may not
+survive" — all true, all things said *about* the tool during design, and
+all wrong to put *in* the tool itself: a model reading that description
+before deciding would route everything to `search_filings`, pre-deciding
+the very comparison this phase exists to run empirically. Cut on review;
+the refusal paragraph stayed, since that one *is* decision-relevant (it
+tells the model the tool is honest about its limits, which isn't the same
+as being honest about being the weaker tool).
+
+The ticker list inside `search_filings`/`ask_filings`'s descriptions is
+built once at server startup from a real `companies.list_companies()`
+query (`_TICKERS` in `mcp_server.py`), not hardcoded — a literal list goes
+stale the moment another ticker gets ingested. Inlining the list this way
+is fine at 5 companies; past some size (a few dozen? a few hundred?) it
+should be dropped from the description entirely in favor of just pointing
+the model at `list_companies()` — the description itself should stay
+short regardless of how large the corpus gets.
+
+### Errors are read by a model, not a program
+
+REST: `TickerNotFound` → `404`, a status code a program branches on. MCP:
+the *same* exception (raised from the *same* place — `search()`/`ask()`
+in `core`-adjacent business logic, no duplicate check) is caught in
+`mcp_server.py` and turned into a sentence the model can act on:
+`"TSLA is not in this corpus. Available companies: AAPL, FISV, GOOGL,
+MSFT, NVDA."` — naming the fix, not just the failure. Same exceptions as
+Phase 4 (`TickerNotFound`, `QuotaExhausted`, `IndexNotReady`), completely
+different presentation, via `mcp_server._friendly_error()`.
+
+### stdio: stdout is the protocol
+
+Audited every module transitively imported by `mcp_server.py` for stray
+`print()` calls (`grep -rn "print(" ...` across `search.py`, `ask.py`,
+`companies.py`, `embeddings.py`, `generation.py`, `providers/`, `core/`) —
+found two real ones, both on the actual call path (not hypothetical):
+`embeddings.py`'s and `providers/groq_provider.py`'s 429-retry messages
+were printing to stdout, which would corrupt the message stream the
+moment a rate limit was hit mid-session. Both now print to `stderr`
+explicitly. `vector_index.py` also has print statements in a module
+`health.py` (and transitively this server) imports, but the specific
+functions containing them (`ensure_vector_index`/`wait_until_ready`) are
+never called by anything this server invokes — left alone, since fixing
+them wasn't fixing a reachable bug.
+
+### `.env` loading independent of the working directory
+
+`config.py` used to resolve `.env` relative to the process's current
+working directory — invisible for every CLI so far, since `uv run`
+launches from the project root where a relative path happens to also
+work. Claude Desktop launches the MCP server with its own working
+directory (not necessarily this project's) and a minimal environment (no
+inherited shell `PATH`). Fixed once, for every entry point: `.env`'s path
+is now resolved from `config.py`'s own file location
+(`Path(__file__).resolve().parent.parent.parent / ".env"`), never the cwd.
+Verified by actually running a script from `/tmp` and confirming
+`Settings()` still loads correctly.
+
+### Claude Desktop wiring
+
+Config: `~/Library/Application Support/Claude/claude_desktop_config.json`
+— merge in (don't overwrite; this file has other real settings):
+
+```json
+"mcpServers": {
+  "finanalyzer": {
+    "command": "/Users/yashpatel/.local/bin/uv",
+    "args": ["--directory", "/Users/yashpatel/Downloads/VSCodeProjects/FinAnalyzer", "run", "mcp-serve"]
+  }
+}
+```
+
+Both paths absolute, for the same minimal-environment reason as the `.env`
+fix above. Requires a **full quit** of Claude Desktop (Cmd+Q), not just
+closing the window — it only reads this file at process startup.
+
+### Verifying it works without a browser
+
+`mcp dev <file>` opens Inspector's browser UI, which can't be driven from
+here. Verified instead with a real `mcp.client` session over stdio,
+spawned with a deliberately minimal `env` (`PATH` only, no project-related
+vars) and `cwd="/"` — the exact conditions Claude Desktop's launch creates
+— confirming `list_tools()` returns all 3 tools and each one behaves
+correctly (including the `TickerNotFound` → friendly-text path) under
+those conditions, not just under a normal shell.
+
 ## Running things
 
 ```
@@ -657,5 +800,7 @@ uv run ask "how does Apple describe supply chain risk?"      # cited, grounded a
 uv run ask "..." --ticker MSFT --k 3 --show-prompt           # print the exact prompt before sending it
 uv run eval                             # recall@5, groundedness %, refusal rate
 uv run serve                            # FastAPI server on :8000 -- /docs for the Swagger UI (Phase 4)
+uv run mcp-serve                        # MCP server over stdio (Phase 5)
+mcp dev src/fin_analyzer/mcp_server.py  # MCP Inspector, for interactive testing
 uv run pytest                           # tests (needs .env configured — see README)
 ```

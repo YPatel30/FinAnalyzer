@@ -13,9 +13,16 @@ them wrong produces a system that half-works and is hard to debug):
    representation learning) leaves the vector's L2 norm != 1, which silently
    makes cosine similarity wrong unless normalized by hand — see _normalize().
 3. Every vector's length is asserted before it's allowed anywhere near Mongo.
+
+Progress/retry messages print to stderr, not stdout (via print(..., file=
+sys.stderr)) — this module is on search()/ask()'s call path, and the MCP
+server (Phase 5) talks to its client over stdio, where stdout *is* the
+protocol. A stray print() there doesn't just look messy, it corrupts the
+message stream.
 """
 
 import math
+import sys
 import time
 
 from google import genai
@@ -92,13 +99,13 @@ def _embed_batch_with_fallback(
     except Exception as exc:
         if isinstance(exc, errors.APIError) and exc.code == 429:
             raise
-        print(f"  batch embed call failed ({exc}); falling back to {len(batch)} individual call(s)")
+        print(f"  batch embed call failed ({exc}); falling back to {len(batch)} individual call(s)", file=sys.stderr)
         results: list[list[float] | None] = []
         for text, label in zip(batch, batch_labels):
             try:
                 results.extend(_embed_one_call(client, [text], task_type, settings))
             except Exception as item_exc:
-                print(f"  SKIPPING {label}: {item_exc}")
+                print(f"  SKIPPING {label}: {item_exc}", file=sys.stderr)
                 results.append(None)
         return results
 
@@ -125,7 +132,7 @@ def _embed_one_call(
             is_rate_limited = exc.code == 429
             if not is_rate_limited or attempt == MAX_RETRIES:
                 raise
-            print(f"    rate limited (429), retrying in {delay:.0f}s (attempt {attempt}/{MAX_RETRIES})")
+            print(f"    rate limited (429), retrying in {delay:.0f}s (attempt {attempt}/{MAX_RETRIES})", file=sys.stderr)
             time.sleep(delay)
             delay *= BACKOFF_MULTIPLIER
 

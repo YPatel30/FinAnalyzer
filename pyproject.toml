@@ -19,6 +19,7 @@ dependencies = [
     "pydantic>=2.6",
     "groq>=1.7.0",
     "fastapi[standard]>=0.141.1",
+    "mcp>=2.2.0",
 ]
 
 [project.scripts]
@@ -28,6 +29,7 @@ search = "fin_analyzer.cli_search:main"
 eval = "fin_analyzer.cli_eval:main"
 ask = "fin_analyzer.cli_ask:main"
 serve = "fin_analyzer.cli_serve:main"
+mcp-serve = "fin_analyzer.mcp_server:main"
 
 [dependency-groups]
 dev = [
